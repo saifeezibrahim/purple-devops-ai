@@ -1,0 +1,15 @@
+{
+    "servers": [
+        {
+            "id": "REDACTED",
+            "name": "web-1",
+            "state": "running",
+            "commercial_type": "DEV1-S",
+            "tags": ["production"],
+            "public_ips": [
+                {"id": "ip-1", "address": "51.15.1.2", "family": "inet"}
+            ],
+            "zone": "fr-par-1"
+        }
+    ]
+}

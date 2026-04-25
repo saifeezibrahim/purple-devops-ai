@@ -1,0 +1,83 @@
+use std::io::Write;
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+
+/// Cached clipboard command detection result.
+static CLIPBOARD_CMD: OnceLock<Result<&'static str, String>> = OnceLock::new();
+
+/// Try to find a working clipboard command by checking PATH (cached after first call).
+fn clipboard_cmd() -> Result<&'static str, String> {
+    CLIPBOARD_CMD
+        .get_or_init(|| {
+            let candidates = [
+                ("pbcopy", &[][..]),                         // macOS
+                ("wl-copy", &[][..]),                        // Wayland
+                ("xclip", &["-selection", "clipboard"][..]), // X11
+                ("xsel", &["--clipboard", "--input"][..]),   // X11 alt
+            ];
+
+            for (cmd, _) in &candidates {
+                let found = Command::new("sh")
+                    .args(["-c", &format!("command -v {} >/dev/null 2>&1", cmd)])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success());
+                if found {
+                    return Ok(*cmd);
+                }
+            }
+
+            Err(crate::messages::NO_CLIPBOARD_TOOL.to_string())
+        })
+        .clone()
+}
+
+/// Get the extra args needed for a clipboard command.
+fn clipboard_args(cmd: &str) -> &'static [&'static str] {
+    match cmd {
+        "xclip" => &["-selection", "clipboard"],
+        "xsel" => &["--clipboard", "--input"],
+        _ => &[],
+    }
+}
+
+/// Copy text to the system clipboard.
+pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    let cmd = clipboard_cmd()?;
+    let args = clipboard_args(cmd);
+
+    let mut child = Command::new(cmd)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| format!("Failed to run {}.", cmd))?;
+
+    let write_result = (|| {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| format!("Failed to write to {}.", cmd))?;
+        stdin
+            .write_all(text.as_bytes())
+            .map_err(|_| format!("Failed to write to {}.", cmd))
+    })();
+
+    // Drop stdin so the child process gets EOF before we wait
+    child.stdin.take();
+
+    // Reap the child process and check exit status
+    let status = child
+        .wait()
+        .map_err(|_| format!("Failed to wait for {}.", cmd))?;
+
+    write_result?;
+
+    if !status.success() {
+        return Err(format!("{} exited with error.", cmd));
+    }
+
+    Ok(())
+}

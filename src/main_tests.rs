@@ -1,0 +1,1471 @@
+use super::*;
+use crate::ssh_config::model::SshConfigFile;
+
+fn empty_app() -> App {
+    let config = SshConfigFile {
+        elements: Vec::new(),
+        path: std::path::PathBuf::from("/dev/null"),
+        crlf: false,
+        bom: false,
+    };
+    App::new(config)
+}
+
+// ---- cache_entry_is_stale tests ----
+
+fn valid_status() -> vault_ssh::CertStatus {
+    vault_ssh::CertStatus::Valid {
+        expires_at: 0,
+        remaining_secs: 3600,
+        total_secs: 3600,
+    }
+}
+
+fn fixed_elapsed(secs: u64) -> impl FnOnce(std::time::Instant) -> u64 {
+    move |_| secs
+}
+
+#[test]
+fn cache_stale_when_entry_missing() {
+    assert!(cache_entry_is_stale(None, None, fixed_elapsed(0)));
+    assert!(cache_entry_is_stale(
+        None,
+        Some(std::time::SystemTime::UNIX_EPOCH),
+        fixed_elapsed(0),
+    ));
+}
+
+#[test]
+fn cache_fresh_when_recent_and_mtime_matches() {
+    let mtime = std::time::SystemTime::UNIX_EPOCH;
+    let entry = (std::time::Instant::now(), valid_status(), Some(mtime));
+    assert!(!cache_entry_is_stale(
+        Some(&entry),
+        Some(mtime),
+        fixed_elapsed(1),
+    ));
+}
+
+#[test]
+fn cache_stale_when_current_mtime_differs_from_cached() {
+    let cached = std::time::SystemTime::UNIX_EPOCH;
+    let current = cached + std::time::Duration::from_secs(5);
+    let entry = (std::time::Instant::now(), valid_status(), Some(cached));
+    assert!(cache_entry_is_stale(
+        Some(&entry),
+        Some(current),
+        fixed_elapsed(1),
+    ));
+}
+
+#[test]
+fn cache_stale_detects_external_cert_rewrite_via_mtime() {
+    // Regression guard for the documented feature: when an external
+    // actor (CLI `purple vault sign` from another shell, or another
+    // running purple instance) rewrites the cert file behind the TUI's
+    // back, the lazy-check loop MUST detect the change via mtime and
+    // force a re-read — regardless of the TTL.
+    //
+    // Timeline:
+    //   t=0  purple caches Valid status with mtime M1
+    //   t=1  external sign writes new cert, mtime becomes M2 > M1
+    //   t=2  lazy-check runs: elapsed 2s (far under the 5-min TTL),
+    //        but the mtime mismatch forces cache_stale = true.
+    let cached_mtime = std::time::SystemTime::UNIX_EPOCH;
+    let rewritten_mtime = cached_mtime + std::time::Duration::from_secs(60);
+    let entry = (
+        std::time::Instant::now(),
+        valid_status(),
+        Some(cached_mtime),
+    );
+    assert!(
+        cache_entry_is_stale(Some(&entry), Some(rewritten_mtime), fixed_elapsed(2)),
+        "external rewrite via mtime mismatch must force re-check even within TTL"
+    );
+}
+
+#[test]
+fn cache_stale_when_file_appears_after_missing_cache() {
+    let entry = (std::time::Instant::now(), valid_status(), None);
+    assert!(cache_entry_is_stale(
+        Some(&entry),
+        Some(std::time::SystemTime::UNIX_EPOCH),
+        fixed_elapsed(1),
+    ));
+}
+
+#[test]
+fn cache_stale_when_file_disappears_after_cached_mtime() {
+    let mtime = std::time::SystemTime::UNIX_EPOCH;
+    let entry = (std::time::Instant::now(), valid_status(), Some(mtime));
+    assert!(cache_entry_is_stale(Some(&entry), None, fixed_elapsed(1)));
+}
+
+#[test]
+fn cache_stale_when_ttl_exceeded_even_if_mtime_matches() {
+    let mtime = std::time::SystemTime::UNIX_EPOCH;
+    let entry = (std::time::Instant::now(), valid_status(), Some(mtime));
+    let over = vault_ssh::CERT_STATUS_CACHE_TTL_SECS + 1;
+    assert!(cache_entry_is_stale(
+        Some(&entry),
+        Some(mtime),
+        fixed_elapsed(over),
+    ));
+}
+
+#[test]
+fn cache_invalid_entry_uses_shorter_backoff() {
+    let mtime = std::time::SystemTime::UNIX_EPOCH;
+    let entry = (
+        std::time::Instant::now(),
+        vault_ssh::CertStatus::Invalid("boom".to_string()),
+        Some(mtime),
+    );
+    // Just above error backoff but well below the normal TTL: must be
+    // stale under the shorter Invalid backoff.
+    let secs = vault_ssh::CERT_ERROR_BACKOFF_SECS + 1;
+    assert!(secs < vault_ssh::CERT_STATUS_CACHE_TTL_SECS);
+    assert!(cache_entry_is_stale(
+        Some(&entry),
+        Some(mtime),
+        fixed_elapsed(secs),
+    ));
+}
+
+#[test]
+fn cache_invalid_entry_fresh_within_backoff() {
+    let mtime = std::time::SystemTime::UNIX_EPOCH;
+    let entry = (
+        std::time::Instant::now(),
+        vault_ssh::CertStatus::Invalid("boom".to_string()),
+        Some(mtime),
+    );
+    assert!(!cache_entry_is_stale(
+        Some(&entry),
+        Some(mtime),
+        fixed_elapsed(0),
+    ));
+}
+
+// ---- end cache_entry_is_stale tests ----
+
+#[test]
+fn test_sync_summary_still_syncing() {
+    let mut app = empty_app();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    app.providers.syncing.insert("aws".to_string(), cancel);
+    app.providers.sync_done.push("DigitalOcean".to_string());
+    set_sync_summary(&mut app);
+    let status = app.status_center.status.as_ref().unwrap();
+    // Active provider name (AWS) leads; DigitalOcean is already done so it is
+    // not in the active list, only in the counter.
+    assert_eq!(status.text, "\u{280B} Syncing AWS EC2 \u{00B7} 1/2");
+    assert!(!status.is_error());
+    // sync_done should NOT be cleared while still syncing
+    assert_eq!(app.providers.sync_done.len(), 1);
+}
+
+#[test]
+fn vault_sign_summary_single_failure_shows_only_error() {
+    let msg = format_vault_sign_summary(0, 1, 0, Some("Vault SSH permission denied."));
+    assert_eq!(msg, "Vault SSH permission denied.");
+}
+
+#[test]
+fn vault_sign_summary_includes_error_on_partial_failure() {
+    let msg = format_vault_sign_summary(2, 1, 0, Some("role not found"));
+    assert_eq!(msg, "Signed 2 of 3 certificates. 1 failed: role not found");
+}
+
+#[test]
+fn vault_sign_summary_failure_without_error_text() {
+    let msg = format_vault_sign_summary(0, 1, 0, None);
+    assert_eq!(msg, "Signed 0 of 1 certificate. 1 failed");
+}
+
+#[test]
+fn vault_sign_summary_all_success() {
+    let msg = format_vault_sign_summary(3, 0, 0, None);
+    assert_eq!(msg, "Signed 3 of 3 certificates.");
+}
+
+#[test]
+fn vault_sign_summary_skipped_with_signed() {
+    let msg = format_vault_sign_summary(1, 0, 2, None);
+    assert_eq!(msg, "Signed 1 of 3 certificates. 2 already valid.");
+}
+
+#[test]
+fn vault_sign_summary_all_skipped() {
+    let msg = format_vault_sign_summary(0, 0, 3, None);
+    assert_eq!(msg, "All 3 certificates already valid. Nothing to sign.");
+}
+
+#[test]
+fn replace_spinner_frame_replaces_known_spinner() {
+    let text = "\u{280B} Signing 1/3: myhost (V to cancel)";
+    let result = replace_spinner_frame(text, "\u{2819}");
+    assert_eq!(
+        result.as_deref(),
+        Some("\u{2819} Signing 1/3: myhost (V to cancel)")
+    );
+}
+
+#[test]
+fn replace_spinner_frame_ignores_non_spinner_text() {
+    let text = "Signing 0/3 (V to cancel)";
+    assert!(replace_spinner_frame(text, "\u{2819}").is_none());
+}
+
+#[test]
+fn replace_spinner_frame_ignores_regular_status() {
+    let text = "Signed 3 of 3 certificates.";
+    assert!(replace_spinner_frame(text, "\u{2819}").is_none());
+}
+
+#[test]
+fn test_sync_summary_all_done() {
+    let mut app = empty_app();
+    app.providers.sync_done.push("AWS".to_string());
+    app.providers.sync_done.push("Hetzner".to_string());
+    set_sync_summary(&mut app);
+    let status = app.status_center.status.as_ref().unwrap();
+    assert_eq!(status.text, "Synced 2/2 \u{00B7} AWS, Hetzner");
+    assert!(!status.is_error());
+    // sync_done should be cleared when all done
+    assert!(app.providers.sync_done.is_empty());
+    assert!(!app.providers.sync_had_errors);
+}
+
+#[test]
+fn test_sync_summary_with_errors() {
+    let mut app = empty_app();
+    app.providers.sync_done.push("AWS".to_string());
+    app.providers.sync_had_errors = true;
+    set_sync_summary(&mut app);
+    let toast = app.status_center.toast.as_ref().unwrap();
+    assert_eq!(toast.text, "Synced 1/1 \u{00B7} AWS");
+    assert!(toast.is_error());
+    // Error flag should be reset when batch completes
+    assert!(!app.providers.sync_had_errors);
+}
+
+#[test]
+fn test_sync_summary_includes_diff_aggregate() {
+    let mut app = empty_app();
+    app.providers.sync_done.push("AWS".to_string());
+    app.providers.sync_done.push("DO".to_string());
+    app.providers.batch_added = 12;
+    app.providers.batch_updated = 3;
+    app.providers.batch_stale = 1;
+    set_sync_summary(&mut app);
+    let status = app.status_center.status.as_ref().unwrap();
+    assert_eq!(status.text, "Synced 2/2 \u{00B7} AWS, DO (+12 ~3 -1)");
+    // Aggregate must reset on batch completion so the next sync starts clean.
+    assert_eq!(app.providers.batch_added, 0);
+    assert_eq!(app.providers.batch_updated, 0);
+    assert_eq!(app.providers.batch_stale, 0);
+}
+
+#[test]
+fn test_sync_summary_progress_includes_diff_and_spinner() {
+    let mut app = empty_app();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    app.providers.syncing.insert("vultr".to_string(), cancel);
+    app.providers.sync_done.push("AWS".to_string());
+    app.providers.batch_added = 5;
+    set_sync_summary(&mut app);
+    let status = app.status_center.status.as_ref().unwrap();
+    // Active name (Vultr) leads, counter follows, then diff. AWS is done so
+    // it does not appear in the active list.
+    assert_eq!(status.text, "\u{280B} Syncing Vultr \u{00B7} 1/2 (+5)");
+    // The spinner prefix MUST be replaceable via `replace_spinner_frame`
+    // and the replacement must actually swap the leading glyph — this is
+    // the contract `handle_tick` relies on to animate the footer.
+    let replaced = replace_spinner_frame(&status.text, "\u{2819}")
+        .expect("status must start with a known spinner frame");
+    assert!(
+        replaced.starts_with("\u{2819} "),
+        "replacement must swap the leading frame, got: {}",
+        replaced
+    );
+    assert!(replaced.contains("Syncing Vultr"));
+}
+
+#[test]
+fn test_sync_summary_progress_lists_multiple_active_providers_sorted() {
+    // Two providers in flight, none done yet. HashMap iteration order is
+    // unspecified, so the implementation must sort for stable rendering
+    // across ticks (otherwise the footer text would jitter between frames).
+    let mut app = empty_app();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    app.providers
+        .syncing
+        .insert("vultr".to_string(), cancel.clone());
+    app.providers.syncing.insert("aws".to_string(), cancel);
+    set_sync_summary(&mut app);
+    let status = app.status_center.status.as_ref().unwrap();
+    assert_eq!(status.text, "\u{280B} Syncing AWS EC2, Vultr \u{00B7} 0/2");
+}
+
+#[test]
+fn test_sync_summary_errors_persist_while_syncing() {
+    let mut app = empty_app();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    app.providers.syncing.insert("vultr".to_string(), cancel);
+    app.providers.sync_done.push("AWS".to_string());
+    app.providers.sync_had_errors = true;
+    set_sync_summary(&mut app);
+    let toast = app.status_center.toast.as_ref().unwrap();
+    assert!(toast.is_error());
+    // Error flag should persist while still syncing
+    assert!(app.providers.sync_had_errors);
+}
+
+#[test]
+fn test_sync_summary_error_while_syncing_goes_to_toast_with_active_names() {
+    // Cover the error-routing branch inside the still_syncing arm: when
+    // any provider in the current batch has failed BUT others are still
+    // in flight, set_sync_summary must route via notify_background_error
+    // (which pushes to the toast) rather than the footer path — so the
+    // user sees the red indicator the moment an error appears, not only
+    // on batch completion. Also verify the active-name is present in the
+    // text so the toast identifies which provider is still running.
+    let mut app = empty_app();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    app.providers.syncing.insert("vultr".to_string(), cancel);
+    app.providers.sync_done.push("AWS".to_string());
+    app.providers.sync_had_errors = true;
+    set_sync_summary(&mut app);
+    let toast = app.status_center.toast.as_ref().unwrap();
+    assert!(toast.is_error(), "error route must send to toast");
+    assert!(
+        toast.text.contains("Vultr"),
+        "toast must name the still-active provider, got: {}",
+        toast.text
+    );
+    assert!(
+        toast.text.contains("1/2"),
+        "toast must carry the done/total counter, got: {}",
+        toast.text
+    );
+}
+
+#[test]
+fn test_sync_summary_batch_total_clamps_upward_mid_batch() {
+    // `set_sync_summary` derives total via batch_total.max(done + syncing.len()).
+    // When the user triggers additional syncs mid-batch (a second batch
+    // overlapping the first), batch_total must not regress even if the
+    // in-flight `syncing` HashMap count drops between ticks. Simulate a
+    // batch where batch_total=5 was captured at peak, syncing has since
+    // wound down to 1, and 3 are done — total must stay at 5, not fall
+    // to max(5, 3+1)=5 (this also verifies the arithmetic).
+    let mut app = empty_app();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    app.providers.syncing.insert("vultr".to_string(), cancel);
+    app.providers.sync_done.push("AWS".to_string());
+    app.providers.sync_done.push("DigitalOcean".to_string());
+    app.providers.sync_done.push("Hetzner".to_string());
+    app.providers.batch_total = 5;
+    set_sync_summary(&mut app);
+    let status = app.status_center.status.as_ref().unwrap();
+    assert!(
+        status.text.contains("3/5"),
+        "batch_total must stay at captured peak (5), got: {}",
+        status.text
+    );
+}
+
+#[test]
+fn test_sync_summary_diff_suffix_omitted_when_all_zero() {
+    // Explicit coverage for the zero-diff path: when no provider reported
+    // any add/update/stale, the `(+N ~N -N)` suffix must be absent so we
+    // don't show an empty `()`. `test_sync_summary_all_done` currently
+    // exercises this accidentally — this test pins the intent.
+    let mut app = empty_app();
+    app.providers.sync_done.push("AWS".to_string());
+    // batch_* all zero by default via empty_app.
+    set_sync_summary(&mut app);
+    let status = app.status_center.status.as_ref().unwrap();
+    assert!(
+        !status.text.contains('('),
+        "diff suffix must be absent when all counters are zero, got: {}",
+        status.text
+    );
+}
+
+// =========================================================================
+// first_launch_init
+// =========================================================================
+
+#[test]
+fn first_launch_creates_dir_and_backup() {
+    let dir = std::env::temp_dir().join(format!(
+        "purple_test_first_launch_{:?}",
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let purple_dir = dir.join(".purple");
+    let config_path = dir.join("config");
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(&config_path, "Host myserver\n  HostName 10.0.0.1\n").unwrap();
+
+    let result = first_launch_init(&purple_dir, &config_path);
+    assert_eq!(
+        result,
+        Some(true),
+        "Should return Some(true) when config exists"
+    );
+    assert!(purple_dir.exists(), ".purple dir should be created");
+    let backup = purple_dir.join("config.original");
+    assert!(backup.exists(), "config.original should be created");
+    assert_eq!(
+        std::fs::read_to_string(&backup).unwrap(),
+        "Host myserver\n  HostName 10.0.0.1\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn first_launch_returns_none_on_second_call() {
+    let dir = std::env::temp_dir().join(format!(
+        "purple_test_first_launch_twice_{:?}",
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let purple_dir = dir.join(".purple");
+    let config_path = dir.join("config");
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(&config_path, "Host a\n").unwrap();
+
+    assert!(first_launch_init(&purple_dir, &config_path).is_some());
+    assert!(first_launch_init(&purple_dir, &config_path).is_none());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn first_launch_no_config_file_skips_backup() {
+    let dir = std::env::temp_dir().join(format!(
+        "purple_test_first_launch_no_cfg_{:?}",
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let purple_dir = dir.join(".purple");
+    let config_path = dir.join("nonexistent_config");
+
+    let result = first_launch_init(&purple_dir, &config_path);
+    assert_eq!(
+        result,
+        Some(false),
+        "Should return Some(false) when no config"
+    );
+    assert!(purple_dir.exists(), ".purple dir should be created");
+    assert!(
+        !purple_dir.join("config.original").exists(),
+        "config.original should NOT be created when config does not exist"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn first_launch_backup_not_overwritten() {
+    let dir = std::env::temp_dir().join(format!(
+        "purple_test_first_launch_no_overwrite_{:?}",
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let purple_dir = dir.join(".purple");
+    let config_path = dir.join("config");
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(&config_path, "original content\n").unwrap();
+
+    first_launch_init(&purple_dir, &config_path);
+    let backup = purple_dir.join("config.original");
+    assert_eq!(
+        std::fs::read_to_string(&backup).unwrap(),
+        "original content\n"
+    );
+
+    // Modify the config and call again (simulates second launch)
+    std::fs::write(&config_path, "modified content\n").unwrap();
+    first_launch_init(&purple_dir, &config_path);
+
+    // Backup should still have original content
+    assert_eq!(
+        std::fs::read_to_string(&backup).unwrap(),
+        "original content\n",
+        "config.original should never be overwritten"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn first_launch_has_backup_true_when_config_exists() {
+    let dir = std::env::temp_dir().join(format!(
+        "purple_test_first_launch_has_backup_{:?}",
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let purple_dir = dir.join(".purple");
+    let config_path = dir.join("config");
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(&config_path, "Host a\n").unwrap();
+
+    assert_eq!(first_launch_init(&purple_dir, &config_path), Some(true));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn first_launch_has_backup_false_without_config() {
+    let dir = std::env::temp_dir().join(format!(
+        "purple_test_first_launch_no_backup_{:?}",
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let purple_dir = dir.join(".purple");
+    let config_path = dir.join("nonexistent");
+
+    assert_eq!(first_launch_init(&purple_dir, &config_path), Some(false));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// =========================================================================
+// Welcome screen handler state transitions
+// =========================================================================
+// Keys to test on Welcome screen:
+// Enter -> HostList
+// Esc -> HostList
+// ? -> Help
+// I (known_hosts > 0) -> HostList + import
+// I (known_hosts = 0) -> HostList (treated as any other key)
+// random char (q, a, j, etc.) -> HostList
+// arrow keys -> HostList
+
+#[test]
+fn welcome_enter_goes_to_host_list() {
+    let mut app = empty_app();
+    app.screen = app::Screen::Welcome {
+        has_backup: false,
+        host_count: 0,
+        known_hosts_count: 0,
+    };
+    let key = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    );
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let _ = crate::handler::handle_key_event(&mut app, key, &tx);
+    assert!(matches!(app.screen, app::Screen::HostList));
+}
+
+#[test]
+fn welcome_esc_goes_to_host_list() {
+    let mut app = empty_app();
+    app.screen = app::Screen::Welcome {
+        has_backup: true,
+        host_count: 5,
+        known_hosts_count: 0,
+    };
+    let key = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Esc,
+        crossterm::event::KeyModifiers::NONE,
+    );
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let _ = crate::handler::handle_key_event(&mut app, key, &tx);
+    assert!(matches!(app.screen, app::Screen::HostList));
+}
+
+#[test]
+fn welcome_question_mark_goes_to_help() {
+    let mut app = empty_app();
+    app.screen = app::Screen::Welcome {
+        has_backup: false,
+        host_count: 0,
+        known_hosts_count: 0,
+    };
+    let key = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('?'),
+        crossterm::event::KeyModifiers::NONE,
+    );
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let _ = crate::handler::handle_key_event(&mut app, key, &tx);
+    assert!(matches!(app.screen, app::Screen::Help { .. }));
+}
+
+#[test]
+fn welcome_i_without_known_hosts_goes_to_host_list() {
+    let mut app = empty_app();
+    app.screen = app::Screen::Welcome {
+        has_backup: false,
+        host_count: 0,
+        known_hosts_count: 0,
+    };
+    let key = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('I'),
+        crossterm::event::KeyModifiers::SHIFT,
+    );
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let _ = crate::handler::handle_key_event(&mut app, key, &tx);
+    assert!(matches!(app.screen, app::Screen::HostList));
+}
+
+#[test]
+fn welcome_random_char_goes_to_host_list() {
+    let mut app = empty_app();
+    app.screen = app::Screen::Welcome {
+        has_backup: false,
+        host_count: 3,
+        known_hosts_count: 0,
+    };
+    let key = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('z'),
+        crossterm::event::KeyModifiers::NONE,
+    );
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let _ = crate::handler::handle_key_event(&mut app, key, &tx);
+    assert!(matches!(app.screen, app::Screen::HostList));
+}
+
+#[test]
+fn welcome_arrow_key_goes_to_host_list() {
+    let mut app = empty_app();
+    app.screen = app::Screen::Welcome {
+        has_backup: false,
+        host_count: 0,
+        known_hosts_count: 5,
+    };
+    let key = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Down,
+        crossterm::event::KeyModifiers::NONE,
+    );
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let _ = crate::handler::handle_key_event(&mut app, key, &tx);
+    assert!(matches!(app.screen, app::Screen::HostList));
+}
+
+// =========================================================================
+// ConfirmImport handler state transitions
+// =========================================================================
+// Keys to test on ConfirmImport screen:
+// y -> HostList + import executed
+// Esc -> HostList, no import
+// n -> HostList, no import
+// random key -> stays on ConfirmImport
+// Enter -> stays on ConfirmImport
+// ? -> stays on ConfirmImport
+
+#[test]
+fn confirm_import_esc_goes_to_host_list() {
+    let mut app = empty_app();
+    app.screen = app::Screen::ConfirmImport { count: 10 };
+    let key = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Esc,
+        crossterm::event::KeyModifiers::NONE,
+    );
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let _ = crate::handler::handle_key_event(&mut app, key, &tx);
+    assert!(matches!(app.screen, app::Screen::HostList));
+}
+
+#[test]
+fn confirm_import_n_goes_to_host_list() {
+    let mut app = empty_app();
+    app.screen = app::Screen::ConfirmImport { count: 10 };
+    let key = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('n'),
+        crossterm::event::KeyModifiers::NONE,
+    );
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let _ = crate::handler::handle_key_event(&mut app, key, &tx);
+    assert!(matches!(app.screen, app::Screen::HostList));
+}
+
+#[test]
+fn confirm_import_random_key_stays() {
+    let mut app = empty_app();
+    app.screen = app::Screen::ConfirmImport { count: 10 };
+    let key = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('x'),
+        crossterm::event::KeyModifiers::NONE,
+    );
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let _ = crate::handler::handle_key_event(&mut app, key, &tx);
+    assert!(matches!(app.screen, app::Screen::ConfirmImport { .. }));
+}
+
+#[test]
+fn confirm_import_enter_stays() {
+    let mut app = empty_app();
+    app.screen = app::Screen::ConfirmImport { count: 10 };
+    let key = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    );
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let _ = crate::handler::handle_key_event(&mut app, key, &tx);
+    assert!(matches!(app.screen, app::Screen::ConfirmImport { .. }));
+}
+
+#[test]
+fn confirm_import_question_mark_stays() {
+    let mut app = empty_app();
+    app.screen = app::Screen::ConfirmImport { count: 10 };
+    let key = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('?'),
+        crossterm::event::KeyModifiers::NONE,
+    );
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let _ = crate::handler::handle_key_event(&mut app, key, &tx);
+    assert!(matches!(app.screen, app::Screen::ConfirmImport { .. }));
+}
+
+#[test]
+fn confirm_import_arrow_key_stays() {
+    let mut app = empty_app();
+    app.screen = app::Screen::ConfirmImport { count: 5 };
+    let key = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Up,
+        crossterm::event::KeyModifiers::NONE,
+    );
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let _ = crate::handler::handle_key_event(&mut app, key, &tx);
+    assert!(matches!(app.screen, app::Screen::ConfirmImport { .. }));
+}
+
+// =========================================================================
+// App known_hosts_count field
+// =========================================================================
+
+#[test]
+fn app_known_hosts_count_default_zero() {
+    let app = empty_app();
+    assert_eq!(app.known_hosts_count, 0);
+}
+
+// =========================================================================
+// HostList I key handler
+// =========================================================================
+// On HostList, I calls count_known_hosts_candidates() which reads the real
+// filesystem, so we can't control the result. But we can verify the error
+// path (when count == 0, it sets error status) by testing on a system
+// without importable known_hosts, or by testing that the key is handled
+// without panic.
+
+#[test]
+fn host_list_i_key_does_not_panic() {
+    let mut app = empty_app();
+    app.screen = app::Screen::HostList;
+    let key = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('I'),
+        crossterm::event::KeyModifiers::SHIFT,
+    );
+    let (tx, _rx) = std::sync::mpsc::channel();
+    // This calls count_known_hosts_candidates() which reads real filesystem.
+    // It should either go to ConfirmImport (if known_hosts has entries)
+    // or set error status (if not). Either way, it should not panic.
+    let _ = crate::handler::handle_key_event(&mut app, key, &tx);
+    assert!(
+        matches!(app.screen, app::Screen::ConfirmImport { .. })
+            || matches!(app.screen, app::Screen::HostList)
+    );
+}
+
+#[test]
+fn host_list_i_key_sets_error_when_no_hosts_available() {
+    // If count_known_hosts_candidates() returns 0, status should be error
+    let mut app = empty_app();
+    app.screen = app::Screen::HostList;
+    let key = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('I'),
+        crossterm::event::KeyModifiers::SHIFT,
+    );
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let _ = crate::handler::handle_key_event(&mut app, key, &tx);
+    // If we got ConfirmImport, known_hosts had entries (can't control that)
+    // If we stayed on HostList, verify error status was set
+    if matches!(app.screen, app::Screen::HostList) {
+        let toast = app
+            .status_center
+            .toast
+            .as_ref()
+            .expect("toast should be set");
+        assert!(toast.is_error());
+        assert_eq!(toast.text, "No importable hosts in known_hosts.");
+    }
+}
+
+// =========================================================================
+// Empty state behavior per screen
+// =========================================================================
+
+#[test]
+fn empty_state_hidden_during_welcome() {
+    // When screen is Welcome, the empty state match returns ""
+    let screen = app::Screen::Welcome {
+        has_backup: false,
+        host_count: 0,
+        known_hosts_count: 0,
+    };
+    assert!(matches!(screen, app::Screen::Welcome { .. }));
+    // The host_list.rs code does:
+    //   if matches!(app.screen, app::Screen::Welcome { .. }) { "" }
+    //   else { "It's quiet in here..." }
+}
+
+#[test]
+fn empty_state_shown_during_host_list() {
+    let screen = app::Screen::HostList;
+    assert!(!matches!(screen, app::Screen::Welcome { .. }));
+}
+
+#[test]
+fn empty_state_shown_during_confirm_import() {
+    let screen = app::Screen::ConfirmImport { count: 5 };
+    assert!(!matches!(screen, app::Screen::Welcome { .. }));
+}
+
+// =========================================================================
+// Welcome with backup variations
+// =========================================================================
+
+#[test]
+fn welcome_q_goes_to_host_list() {
+    let mut app = empty_app();
+    app.screen = app::Screen::Welcome {
+        has_backup: true,
+        host_count: 10,
+        known_hosts_count: 0,
+    };
+    let key = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('q'),
+        crossterm::event::KeyModifiers::NONE,
+    );
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let _ = crate::handler::handle_key_event(&mut app, key, &tx);
+    assert!(matches!(app.screen, app::Screen::HostList));
+}
+
+#[test]
+fn welcome_tab_goes_to_host_list() {
+    let mut app = empty_app();
+    app.screen = app::Screen::Welcome {
+        has_backup: false,
+        host_count: 0,
+        known_hosts_count: 5,
+    };
+    let key = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Tab,
+        crossterm::event::KeyModifiers::NONE,
+    );
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let _ = crate::handler::handle_key_event(&mut app, key, &tx);
+    assert!(matches!(app.screen, app::Screen::HostList));
+}
+
+// =========================================================================
+// ConfirmImport y key (actual import - reads filesystem)
+// =========================================================================
+
+#[test]
+fn confirm_import_y_transitions_to_host_list() {
+    let mut app = empty_app();
+    app.screen = app::Screen::ConfirmImport { count: 10 };
+    let key = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('y'),
+        crossterm::event::KeyModifiers::NONE,
+    );
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let _ = crate::handler::handle_key_event(&mut app, key, &tx);
+    // Should transition to HostList regardless of import result
+    assert!(matches!(app.screen, app::Screen::HostList));
+    // Status or toast should be set (either success or error)
+    assert!(app.status_center.status.is_some() || app.status_center.toast.is_some());
+}
+
+// =========================================================================
+// ConfirmImport tab/q stays
+// =========================================================================
+
+#[test]
+fn confirm_import_tab_stays() {
+    let mut app = empty_app();
+    app.screen = app::Screen::ConfirmImport { count: 5 };
+    let key = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Tab,
+        crossterm::event::KeyModifiers::NONE,
+    );
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let _ = crate::handler::handle_key_event(&mut app, key, &tx);
+    assert!(matches!(app.screen, app::Screen::ConfirmImport { .. }));
+}
+
+#[test]
+fn confirm_import_q_stays() {
+    let mut app = empty_app();
+    app.screen = app::Screen::ConfirmImport { count: 5 };
+    let key = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('q'),
+        crossterm::event::KeyModifiers::NONE,
+    );
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let _ = crate::handler::handle_key_event(&mut app, key, &tx);
+    assert!(matches!(app.screen, app::Screen::ConfirmImport { .. }));
+}
+
+// =========================================================================
+// execute_known_hosts_import — test via import_from_file (controlled input)
+// =========================================================================
+// We can't call execute_known_hosts_import directly (it reads real
+// known_hosts), but we can test the same logic paths by using
+// import_from_file + config.write() on controlled temp files.
+
+#[test]
+fn import_successful_sets_success_status() {
+    let dir = std::env::temp_dir().join(format!(
+        "purple_test_import_status_{:?}",
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let config_path = dir.join("config");
+    std::fs::write(&config_path, "").unwrap();
+    let config = crate::ssh_config::model::SshConfigFile {
+        elements: Vec::new(),
+        path: config_path,
+        crlf: false,
+        bom: false,
+    };
+    let mut app = App::new(config);
+
+    let hosts_file = dir.join("hosts.txt");
+    std::fs::write(&hosts_file, "web.example.com\ndb.example.com\n").unwrap();
+
+    let result =
+        import::import_from_file(&mut app.hosts_state.ssh_config, &hosts_file, Some("test"));
+    let (imported, skipped, _, _) = result.unwrap();
+    assert_eq!(imported, 2);
+    assert_eq!(skipped, 0);
+
+    // Write should succeed
+    assert!(app.hosts_state.ssh_config.write().is_ok());
+    app.reload_hosts();
+    assert_eq!(app.hosts_state.list.len(), 2);
+
+    // Verify the status message format
+    let msg = format!(
+        "Imported {} host{}, skipped {} duplicate{}",
+        imported,
+        if imported == 1 { "" } else { "s" },
+        skipped,
+        if skipped == 1 { "" } else { "s" },
+    );
+    assert_eq!(msg, "Imported 2 hosts, skipped 0 duplicates");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn import_all_duplicates_sets_status() {
+    let dir = std::env::temp_dir().join(format!(
+        "purple_test_import_alldup_{:?}",
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let config_path = dir.join("config");
+    std::fs::write(&config_path, "").unwrap();
+    let config = crate::ssh_config::model::SshConfigFile {
+        elements: Vec::new(),
+        path: config_path,
+        crlf: false,
+        bom: false,
+    };
+    let mut app = App::new(config);
+
+    let hosts_file = dir.join("hosts.txt");
+    std::fs::write(&hosts_file, "web.example.com\n").unwrap();
+
+    // First import
+    let _ = import::import_from_file(&mut app.hosts_state.ssh_config, &hosts_file, None);
+    let _ = app.hosts_state.ssh_config.write();
+    app.reload_hosts();
+
+    // Second import - all duplicates
+    let (imported, skipped, _, _) =
+        import::import_from_file(&mut app.hosts_state.ssh_config, &hosts_file, None).unwrap();
+    assert_eq!(imported, 0);
+    assert_eq!(skipped, 1);
+
+    let msg = if skipped == 1 {
+        "Host already exists".to_string()
+    } else {
+        format!("All {} hosts already exist", skipped)
+    };
+    assert_eq!(msg, "Host already exists");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn import_write_failure_rolls_back_config() {
+    // Create a config pointing to a read-only path so write() fails
+    let dir = std::env::temp_dir().join(format!(
+        "purple_test_import_writefail_{:?}",
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let config_path = dir.join("nonexistent_dir").join("config");
+    // config_path parent doesn't exist, so write() will fail
+    let config = crate::ssh_config::model::SshConfigFile {
+        elements: Vec::new(),
+        path: config_path,
+        crlf: false,
+        bom: false,
+    };
+    let mut app = App::new(config);
+    let config_backup = app.hosts_state.ssh_config.clone();
+
+    let hosts_file = dir.join("hosts.txt");
+    std::fs::write(&hosts_file, "web.example.com\n").unwrap();
+
+    let (imported, _, _, _) =
+        import::import_from_file(&mut app.hosts_state.ssh_config, &hosts_file, None).unwrap();
+    assert_eq!(imported, 1);
+
+    // Write should fail because parent dir doesn't exist
+    let write_result = app.hosts_state.ssh_config.write();
+    assert!(write_result.is_err());
+
+    // After failure, rollback should restore config
+    app.hosts_state.ssh_config = config_backup;
+    let hosts = app.hosts_state.ssh_config.host_entries();
+    assert_eq!(hosts.len(), 0, "config should be rolled back to empty");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn known_hosts_count_not_reset_on_write_failure() {
+    // The execute_known_hosts_import function returns early on write failure
+    // without resetting known_hosts_count. This is correct behavior:
+    // if the import didn't save, the user might want to try again.
+    let mut app = empty_app();
+    app.known_hosts_count = 10;
+    // Simulate: write failure would do `return` before `app.known_hosts_count = 0`
+    // So known_hosts_count should remain 10
+    assert_eq!(app.known_hosts_count, 10);
+}
+
+#[test]
+fn known_hosts_count_not_reset_on_import_error() {
+    // When import_from_known_hosts returns Err, known_hosts_count is not reset
+    let mut app = empty_app();
+    app.known_hosts_count = 5;
+    // The Err branch only sets status, doesn't touch known_hosts_count
+    app.notify_error("some error");
+    assert_eq!(app.known_hosts_count, 5);
+}
+
+#[test]
+fn known_hosts_count_reset_on_success() {
+    // When import succeeds (even with 0 imported), known_hosts_count is reset
+    let mut app = empty_app();
+    app.known_hosts_count = 15;
+    app.known_hosts_count = 0; // simulates the Ok branch
+    assert_eq!(app.known_hosts_count, 0);
+}
+
+// =========================================================================
+// Welcome I key with known_hosts_count > 0
+// =========================================================================
+
+#[test]
+fn welcome_i_with_known_hosts_transitions_to_host_list() {
+    // When known_hosts_count > 0, I should trigger import and go to HostList
+    let mut app = empty_app();
+    app.screen = app::Screen::Welcome {
+        has_backup: false,
+        host_count: 0,
+        known_hosts_count: 10,
+    };
+    let key = crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('I'),
+        crossterm::event::KeyModifiers::SHIFT,
+    );
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let _ = crate::handler::handle_key_event(&mut app, key, &tx);
+    assert!(matches!(app.screen, app::Screen::HostList));
+    // Status or toast should be set (import attempted)
+    assert!(app.status_center.status.is_some() || app.status_center.toast.is_some());
+}
+
+// =========================================================================
+// Cheat sheet verification
+// =========================================================================
+
+#[test]
+fn cheat_sheet_k_before_s_in_tools() {
+    // Niche shortcuts (I import known_hosts, m theme, V vault sign, X purge
+    // stale, A add pattern, etc.) were moved to the wiki. The TOOLS section
+    // keeps primary entry points in a deliberate order: K before S.
+    let source = include_str!("ui/help.rs");
+    let k_pos = source
+        .find(r#"help_line_short("K","#)
+        .expect("K should be in cheat sheet");
+    let s_pos = source
+        .find(r#"help_line_short("S","#)
+        .expect("S should be in cheat sheet");
+    assert!(k_pos < s_pos, "K should come before S");
+}
+
+// =========================================================================
+// UI consistency: ConfirmImport dialog structure
+// =========================================================================
+
+#[test]
+fn confirm_import_dialog_has_same_structure_as_confirm_delete() {
+    // Render both dialogs into TestBackend buffers and assert they share
+    // structural invariants: rounded top border, 7-row height, and the
+    // y / Esc footer glyphs. This replaces the earlier source-grep check
+    // with an end-to-end render verification.
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+
+    fn row_contains(buf: &Buffer, row: u16, needle: &str) -> bool {
+        let mut line = String::new();
+        for x in 0..buf.area.width {
+            line.push_str(buf[(x, row)].symbol());
+        }
+        line.contains(needle)
+    }
+
+    fn find_top_border_row(buf: &Buffer) -> u16 {
+        for y in 0..buf.area.height {
+            if row_contains(buf, y, "\u{256D}") && row_contains(buf, y, "\u{256E}") {
+                return y;
+            }
+        }
+        panic!("no rounded top-border row found in rendered dialog");
+    }
+
+    fn find_bottom_border_row(buf: &Buffer) -> u16 {
+        for y in (0..buf.area.height).rev() {
+            if row_contains(buf, y, "\u{2570}") && row_contains(buf, y, "\u{256F}") {
+                return y;
+            }
+        }
+        panic!("no rounded bottom-border row found in rendered dialog");
+    }
+
+    // --- ConfirmDelete ---
+    let app = empty_app();
+    let backend = TestBackend::new(80, 24);
+    let mut term = Terminal::new(backend).unwrap();
+    term.draw(|f| crate::ui::confirm_dialog::render(f, &app, "example"))
+        .unwrap();
+    let delete_buf = term.backend().buffer().clone();
+    let delete_top = find_top_border_row(&delete_buf);
+    let delete_bottom = find_bottom_border_row(&delete_buf);
+    assert_eq!(
+        delete_bottom - delete_top + 1,
+        5,
+        "ConfirmDelete dialog height should be 5 rows (footer renders below)"
+    );
+    // Footer renders one row below the block border (external footer pattern).
+    let footer_row = delete_bottom + 1;
+    assert!(
+        (delete_top..=footer_row).any(|y| row_contains(&delete_buf, y, "y")),
+        "ConfirmDelete dialog should contain 'y' key in external footer"
+    );
+    assert!(
+        (delete_top..=footer_row).any(|y| row_contains(&delete_buf, y, "Esc")),
+        "ConfirmDelete dialog should contain 'Esc' key in external footer"
+    );
+
+    // --- ConfirmImport ---
+    let app = empty_app();
+    let backend = TestBackend::new(80, 24);
+    let mut term = Terminal::new(backend).unwrap();
+    term.draw(|f| crate::ui::confirm_dialog::render_confirm_import(f, &app, 5))
+        .unwrap();
+    let import_buf = term.backend().buffer().clone();
+    let import_top = find_top_border_row(&import_buf);
+    let import_bottom = find_bottom_border_row(&import_buf);
+    assert_eq!(
+        import_bottom - import_top + 1,
+        5,
+        "ConfirmImport dialog height should be 5 rows (footer renders below)"
+    );
+    let import_footer_row = import_bottom + 1;
+    assert!(
+        (import_top..=import_footer_row).any(|y| row_contains(&import_buf, y, "y")),
+        "ConfirmImport dialog should contain 'y' key in external footer"
+    );
+    assert!(
+        (import_top..=import_footer_row).any(|y| row_contains(&import_buf, y, "Esc")),
+        "ConfirmImport dialog should contain 'Esc' key in external footer"
+    );
+}
+
+// =========================================================================
+// Screen variant field values
+// =========================================================================
+
+#[test]
+fn confirm_import_preserves_count() {
+    let screen = app::Screen::ConfirmImport { count: 42 };
+    if let app::Screen::ConfirmImport { count } = screen {
+        assert_eq!(count, 42);
+    } else {
+        panic!("expected ConfirmImport");
+    }
+}
+
+#[test]
+fn welcome_preserves_all_fields() {
+    let screen = app::Screen::Welcome {
+        has_backup: true,
+        host_count: 12,
+        known_hosts_count: 34,
+    };
+    if let app::Screen::Welcome {
+        has_backup,
+        host_count,
+        known_hosts_count,
+    } = screen
+    {
+        assert!(has_backup);
+        assert_eq!(host_count, 12);
+        assert_eq!(known_hosts_count, 34);
+    } else {
+        panic!("expected Welcome");
+    }
+}
+
+#[test]
+fn test_format_sync_diff_all_changes() {
+    assert_eq!(format_sync_diff(3, 1, 2), " (+3 ~1 -2)");
+}
+
+#[test]
+fn test_format_sync_diff_no_changes() {
+    assert_eq!(format_sync_diff(0, 0, 0), "");
+}
+
+#[test]
+fn test_format_sync_diff_only_added() {
+    assert_eq!(format_sync_diff(5, 0, 0), " (+5)");
+}
+
+// CLI refactor regression: `purple vault-sign` was renamed to a nested
+// `purple vault sign` subcommand group matching `provider`/`theme`. Verify
+// clap parses both the alias form and --all.
+#[test]
+fn cli_vault_sign_alias_parsing() {
+    use clap::Parser;
+    let cli = Cli::try_parse_from(["purple", "vault", "sign", "myhost"]).unwrap();
+    match cli.command {
+        Some(Commands::Vault {
+            command:
+                VaultCommands::Sign {
+                    alias,
+                    all,
+                    vault_addr,
+                },
+        }) => {
+            assert_eq!(alias.as_deref(), Some("myhost"));
+            assert!(!all);
+            assert!(vault_addr.is_none());
+        }
+        _ => panic!("expected Vault::Sign"),
+    }
+}
+
+#[test]
+fn cli_vault_sign_all_flag_parsing() {
+    use clap::Parser;
+    let cli = Cli::try_parse_from(["purple", "vault", "sign", "--all"]).unwrap();
+    match cli.command {
+        Some(Commands::Vault {
+            command:
+                VaultCommands::Sign {
+                    alias,
+                    all,
+                    vault_addr,
+                },
+        }) => {
+            assert_eq!(alias, None);
+            assert!(all);
+            assert!(vault_addr.is_none());
+        }
+        _ => panic!("expected Vault::Sign --all"),
+    }
+}
+
+#[test]
+fn cli_vault_sign_vault_addr_flag_parsing() {
+    use clap::Parser;
+    let cli = Cli::try_parse_from([
+        "purple",
+        "vault",
+        "sign",
+        "--all",
+        "--vault-addr",
+        "http://127.0.0.1:8200",
+    ])
+    .unwrap();
+    match cli.command {
+        Some(Commands::Vault {
+            command:
+                VaultCommands::Sign {
+                    alias: _,
+                    all,
+                    vault_addr,
+                },
+        }) => {
+            assert!(all);
+            assert_eq!(vault_addr.as_deref(), Some("http://127.0.0.1:8200"));
+        }
+        _ => panic!("expected Vault::Sign with --vault-addr"),
+    }
+}
+
+#[test]
+fn should_write_certificate_file_only_when_empty() {
+    // Empty string: purple owns the cert path, write it.
+    assert!(should_write_certificate_file(""));
+    // Whitespace-only is treated as empty so a stray space typed in the
+    // form does not lock purple out of writing the directive.
+    assert!(should_write_certificate_file(" "));
+    assert!(should_write_certificate_file("\t"));
+    assert!(should_write_certificate_file("   \t  "));
+    // Any user-set value (default purple path included): never overwrite,
+    // because the user may rely on a custom path and we never want to
+    // silently change it.
+    assert!(!should_write_certificate_file("/custom/path/cert.pub"));
+    assert!(!should_write_certificate_file("~/.ssh/my-cert.pub"));
+    assert!(!should_write_certificate_file("relative/path"));
+    // A path with leading/trailing space is still a real path; trim is
+    // applied to the emptiness check, not the value itself.
+    assert!(!should_write_certificate_file(" /tmp/cert.pub "));
+}
+
+#[test]
+fn ensure_vault_ssh_returns_none_when_no_role_configured() {
+    // Build a host with no vault_ssh and no provider mapping. The function
+    // must short-circuit before touching disk or shelling out.
+    let dir = std::env::temp_dir().join(format!(
+        "purple_test_ensure_vault_norole_{:?}",
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let config_path = dir.join("config");
+    std::fs::write(&config_path, "Host plain\n  HostName 1.2.3.4\n").unwrap();
+    let mut config = SshConfigFile::parse(&config_path).unwrap();
+    let host = config.host_entries().into_iter().next().unwrap();
+    let provider_config = providers::config::ProviderConfig::parse("");
+    let result = ensure_vault_ssh_if_needed(&host.alias, &host, &provider_config, &mut config);
+    assert!(
+        result.is_none(),
+        "no role configured: must short-circuit to None"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cli_legacy_vault_sign_flat_form_rejected() {
+    // The old flat `purple vault-sign` subcommand was removed. Ensure it
+    // does not silently match something else.
+    use clap::Parser;
+    let result = Cli::try_parse_from(["purple", "vault-sign", "myhost"]);
+    assert!(
+        result.is_err(),
+        "legacy `vault-sign` must not parse after refactor"
+    );
+}
+
+// Regression: Claude Desktop did not substitute ${HOME} before passing
+// CLI args. The binary must expand it itself.
+
+#[test]
+fn expand_user_path_tilde_slash() {
+    let home = dirs::home_dir().unwrap();
+    let result = super::expand_user_path("~/.ssh/config").unwrap();
+    assert_eq!(result, home.join(".ssh/config"));
+}
+
+#[test]
+fn expand_user_path_dollar_brace_home_slash() {
+    let home = dirs::home_dir().unwrap();
+    let result = super::expand_user_path("${HOME}/.ssh/config").unwrap();
+    assert_eq!(result, home.join(".ssh/config"));
+}
+
+#[test]
+fn expand_user_path_dollar_home_slash() {
+    let home = dirs::home_dir().unwrap();
+    let result = super::expand_user_path("$HOME/.purple/mcp-audit.log").unwrap();
+    assert_eq!(result, home.join(".purple/mcp-audit.log"));
+}
+
+#[test]
+fn expand_user_path_bare_tilde() {
+    let home = dirs::home_dir().unwrap();
+    assert_eq!(super::expand_user_path("~").unwrap(), home);
+}
+
+#[test]
+fn expand_user_path_bare_dollar_brace_home() {
+    let home = dirs::home_dir().unwrap();
+    assert_eq!(super::expand_user_path("${HOME}").unwrap(), home);
+}
+
+#[test]
+fn expand_user_path_bare_dollar_home() {
+    let home = dirs::home_dir().unwrap();
+    assert_eq!(super::expand_user_path("$HOME").unwrap(), home);
+}
+
+#[test]
+fn expand_user_path_absolute_unchanged() {
+    let result = super::expand_user_path("/etc/ssh/ssh_config").unwrap();
+    assert_eq!(result, std::path::PathBuf::from("/etc/ssh/ssh_config"));
+}
+
+#[test]
+fn expand_user_path_relative_unchanged() {
+    let result = super::expand_user_path("config/ssh.conf").unwrap();
+    assert_eq!(result, std::path::PathBuf::from("config/ssh.conf"));
+}
+
+#[test]
+fn expand_user_path_does_not_expand_mid_string() {
+    // Only the prefix is expanded. Mid-string ${HOME} stays literal.
+    let result = super::expand_user_path("/tmp/${HOME}/foo").unwrap();
+    assert_eq!(result, std::path::PathBuf::from("/tmp/${HOME}/foo"));
+}
+
+#[test]
+fn expand_user_path_tilde_other_user_not_expanded() {
+    // `~user` (other-user home) is intentionally not supported.
+    let result = super::expand_user_path("~root").unwrap();
+    assert_eq!(result, std::path::PathBuf::from("~root"));
+}

@@ -1,0 +1,16 @@
+// Library re-exports for integration tests.
+pub(crate) mod askpass_env;
+pub mod changelog;
+pub mod containers;
+pub mod demo_flag;
+pub mod event;
+pub mod file_browser;
+pub mod fs_util;
+pub mod mcp;
+pub mod messages;
+pub mod providers;
+pub mod snippet;
+pub mod ssh_config;
+pub mod ssh_context;
+pub mod tunnel;
+pub mod vault_ssh;

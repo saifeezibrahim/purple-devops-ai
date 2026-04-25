@@ -1,0 +1,50 @@
+# Build
+/target
+/purple-*.mcpb
+/purple-*.mcpb.sha256
+/purple-*.tar.gz
+/purple-*.tar.gz.sha256
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+Icon?
+
+# Demo
+demo-record.py
+demo-screenshots.py
+demo.mov
+
+# IDE
+.idea/
+.vscode/
+.zed/
+*.swp
+*.swo
+*~
+
+# Fuzz
+fuzz/artifacts/
+fuzz/corpus/
+fuzz/target/
+libnull.rlib
+
+# Proptest
+proptest-regressions/
+*.proptest-regressions
+
+# Visual regression diffs (written by failing tests)
+tests/visual_golden/*.actual
+
+# Environment
+.env
+.env.*
+
+# Claude Code
+CLAUDE.md
+.claude/
+docs/

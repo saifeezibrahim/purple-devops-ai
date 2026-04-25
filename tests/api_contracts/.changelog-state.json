@@ -1,0 +1,101 @@
+{
+  "_version": 1,
+  "aws": [
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED"
+  ],
+  "azure": [
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED"
+  ],
+  "digitalocean": [
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED"
+  ],
+  "hetzner": [
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED"
+  ],
+  "ovhcloud": [
+    "REDACTED",
+    "REDACTED",
+    "REDACTED"
+  ],
+  "proxmox": [
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED",
+    "REDACTED"
+  ],
+  "tailscale": [
+    "REDACTED"
+  ],
+  "transip": [
+    "REDACTED"
+  ],
+  "oracle": [
+    "REDACTED",
+    "REDACTED"
+  ]
+}

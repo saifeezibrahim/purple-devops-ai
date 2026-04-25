@@ -1,0 +1,788 @@
+use std::sync::mpsc;
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use crate::app::{App, HostForm, Screen, ViewMode};
+use crate::clipboard;
+use crate::event::AppEvent;
+use crate::preferences;
+use crate::ssh_config::model::ConfigElement;
+
+mod actions;
+
+fn serialize_host_block(elements: &[ConfigElement], alias: &str, crlf: bool) -> Option<String> {
+    let line_ending = if crlf { "\r\n" } else { "\n" };
+    for element in elements {
+        match element {
+            ConfigElement::HostBlock(block) if block.host_pattern == alias => {
+                let mut output = block.raw_host_line.clone();
+                for directive in &block.directives {
+                    output.push_str(line_ending);
+                    output.push_str(&directive.raw_line);
+                }
+                return Some(output);
+            }
+            ConfigElement::Include(include) => {
+                for file in &include.resolved_files {
+                    if let Some(result) = serialize_host_block(&file.elements, alias, crlf) {
+                        return Some(result);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+pub(super) fn handle_host_list(app: &mut App, key: KeyEvent, events_tx: &mpsc::Sender<AppEvent>) {
+    // Handle tag input mode
+    if app.tags.input.is_some() {
+        super::host_detail::handle_tag_input(app, key);
+        return;
+    }
+
+    match key.code {
+        KeyCode::Char('q') => {
+            if let Some(ref cancel) = app.vault.signing_cancel {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            app.running = false;
+        }
+        KeyCode::Esc => {
+            if app.hosts_state.group_filter.is_some() {
+                app.clear_group_filter();
+            } else if !app.hosts_state.multi_select.is_empty() {
+                // Clear the selection before quitting so Esc first resets
+                // bulk-edit intent, then a second Esc exits the app.
+                app.hosts_state.multi_select.clear();
+            } else {
+                if let Some(ref cancel) = app.vault.signing_cancel {
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                app.running = false;
+            }
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.select_next_skipping_headers();
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.select_prev_skipping_headers();
+        }
+        KeyCode::Tab => {
+            app.next_group_tab();
+        }
+        KeyCode::BackTab => {
+            app.prev_group_tab();
+        }
+        KeyCode::PageDown => {
+            app.page_down_host();
+        }
+        KeyCode::PageUp => {
+            app.page_up_host();
+        }
+        KeyCode::Enter => {
+            if app.is_pattern_selected() {
+                return;
+            }
+            if let Some(host) = app.selected_host() {
+                let alias = host.alias.clone();
+                let askpass = host.askpass.clone();
+                let stale_hint = if host.stale.is_some() {
+                    Some(super::stale_provider_hint(host))
+                } else {
+                    None
+                };
+                if let Some(hint) = stale_hint {
+                    app.notify_warning(crate::messages::stale_host(&hint));
+                }
+                if app.demo_mode {
+                    app.notify(crate::messages::DEMO_CONNECTION_DISABLED);
+                    return;
+                }
+                app.pending_connect = Some((alias, askpass));
+            }
+        }
+        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let visible_indices: Vec<usize> = app
+                .hosts_state
+                .display_list
+                .iter()
+                .filter_map(|item| match item {
+                    crate::app::HostListItem::Host { index } => Some(*index),
+                    _ => None,
+                })
+                .collect();
+            let all_selected = !visible_indices.is_empty()
+                && visible_indices
+                    .iter()
+                    .all(|idx| app.hosts_state.multi_select.contains(idx));
+            if all_selected {
+                app.hosts_state.multi_select.clear();
+            } else {
+                for idx in visible_indices {
+                    app.hosts_state.multi_select.insert(idx);
+                }
+            }
+        }
+        KeyCode::Char('a') => {
+            app.forms.host = HostForm::new();
+            app.set_screen(Screen::AddHost);
+            app.capture_form_mtime();
+            app.capture_form_baseline();
+        }
+        KeyCode::Char('A') => {
+            app.forms.host = HostForm::new_pattern();
+            app.set_screen(Screen::AddHost);
+            app.capture_form_mtime();
+            app.capture_form_baseline();
+        }
+        KeyCode::Char('e') => {
+            if let Some(pattern) = app.selected_pattern().cloned() {
+                if pattern.source_file.is_some() {
+                    app.notify_error(crate::messages::included_file_edit(&pattern.pattern));
+                    return;
+                }
+                app.forms.host = HostForm::from_pattern_entry(&pattern);
+                app.set_screen(Screen::EditHost {
+                    alias: pattern.pattern,
+                });
+                app.capture_form_mtime();
+                app.capture_form_baseline();
+            } else if let Some(host) = app.selected_host().cloned() {
+                super::open_edit_form(app, host);
+            }
+        }
+        KeyCode::Char('d') => {
+            if let Some(pattern) = app.selected_pattern() {
+                if pattern.source_file.is_some() {
+                    app.notify_error(crate::messages::included_file_delete(&pattern.pattern));
+                    return;
+                }
+                let alias = pattern.pattern.clone();
+                app.set_screen(Screen::ConfirmDelete { alias });
+            } else if let Some(host) = app.selected_host() {
+                if let Some(ref source) = host.source_file {
+                    let alias = host.alias.clone();
+                    let path = source.display();
+                    app.notify_warning(crate::messages::included_host_lives_in(&alias, &path));
+                    return;
+                }
+                let stale_hint = if host.stale.is_some() {
+                    Some(super::stale_provider_hint(host))
+                } else {
+                    None
+                };
+                let alias = host.alias.clone();
+                if let Some(hint) = stale_hint {
+                    app.notify_warning(crate::messages::stale_host(&hint));
+                }
+                app.set_screen(Screen::ConfirmDelete { alias });
+            }
+        }
+        KeyCode::Char('c') => actions::clone_selected(app),
+        KeyCode::Char('y') => {
+            if app.is_pattern_selected() {
+                return;
+            }
+            if let Some(host) = app.selected_host() {
+                let cmd = host.ssh_command(&app.reload.config_path);
+                let alias = host.alias.clone();
+                match clipboard::copy_to_clipboard(&cmd) {
+                    Ok(()) => {
+                        app.notify(crate::messages::copied_ssh_command(&alias));
+                    }
+                    Err(e) => {
+                        app.notify_error(e);
+                    }
+                }
+            }
+        }
+        KeyCode::Char('x') => {
+            if app.is_pattern_selected() {
+                return;
+            }
+            if let Some(host) = app.selected_host() {
+                let alias = host.alias.clone();
+                if let Some(block) = serialize_host_block(
+                    &app.hosts_state.ssh_config.elements,
+                    &alias,
+                    app.hosts_state.ssh_config.crlf,
+                ) {
+                    match clipboard::copy_to_clipboard(&block) {
+                        Ok(()) => {
+                            app.notify(crate::messages::copied_config_block(&alias));
+                        }
+                        Err(e) => {
+                            app.notify_error(e);
+                        }
+                    }
+                }
+            }
+        }
+        KeyCode::Char('p') => {
+            if app.is_pattern_selected() {
+                return;
+            }
+            if !app.ping.status.is_empty() {
+                app.ping.status.clear();
+                app.ping.filter_down_only = false;
+                app.ping.checked_at = None;
+                app.ping.generation += 1;
+                app.status_center.status = None;
+            } else {
+                super::ping::ping_selected_host(app, events_tx, true);
+            }
+        }
+        KeyCode::Char('P') => {
+            if !app.ping.status.is_empty() {
+                app.ping.status.clear();
+                app.ping.filter_down_only = false;
+                app.ping.checked_at = None;
+                app.ping.generation += 1;
+                app.status_center.status = None;
+            } else {
+                let hosts_to_ping: Vec<(String, String, u16)> = app
+                    .hosts_state
+                    .list
+                    .iter()
+                    .filter(|h| !h.hostname.is_empty() && h.proxy_jump.is_empty())
+                    .map(|h| (h.alias.clone(), h.hostname.clone(), h.port))
+                    .collect();
+                // Mark ProxyJump hosts as Checking (their status will be
+                // inherited from the bastion once it responds).
+                for h in &app.hosts_state.list {
+                    if !h.proxy_jump.is_empty() {
+                        app.ping
+                            .status
+                            .insert(h.alias.clone(), crate::app::PingStatus::Checking);
+                    }
+                }
+                if !hosts_to_ping.is_empty() {
+                    for (alias, _, _) in &hosts_to_ping {
+                        app.ping
+                            .status
+                            .insert(alias.clone(), crate::app::PingStatus::Checking);
+                    }
+                    app.notify_info(crate::messages::PINGING_ALL);
+                    crate::ping::ping_all(&hosts_to_ping, events_tx.clone(), app.ping.generation);
+                }
+            }
+        }
+        KeyCode::Char('!') => {
+            if app.ping.status.is_empty() {
+                app.notify_warning(crate::messages::PING_FIRST);
+            } else {
+                app.ping.filter_down_only = !app.ping.filter_down_only;
+                if app.ping.filter_down_only {
+                    // Activate search mode to trigger filtering
+                    if app.search.query.is_none() {
+                        app.search.query = Some(String::new());
+                    }
+                    app.apply_filter();
+                    let count = app.search.filtered_indices.len();
+                    app.notify(crate::messages::showing_unreachable(count));
+                } else {
+                    // If search was only active for down-only, clear it
+                    if app.search.query.as_ref().is_some_and(|q| q.is_empty()) {
+                        app.search.query = None;
+                        app.search.filtered_indices.clear();
+                        app.search.filtered_pattern_indices.clear();
+                    } else {
+                        app.apply_filter();
+                    }
+                    app.status_center.status = None;
+                }
+            }
+        }
+        KeyCode::Char('/') => {
+            app.start_search();
+        }
+        KeyCode::Char('K') => {
+            app.scan_keys();
+            app.set_screen(Screen::KeyList);
+        }
+        KeyCode::Char('t') => {
+            // Context-sensitive: with a multi-host selection active, open
+            // the bulk tag editor. Otherwise fall back to the single-host
+            // tag input bar. `t` consistently means "edit tags" — only the
+            // scope changes.
+            if !app.hosts_state.multi_select.is_empty() {
+                if !app.open_bulk_tag_editor() {
+                    app.notify_warning(crate::messages::NO_HOSTS_TO_TAG);
+                }
+                return;
+            }
+            if app.is_pattern_selected() {
+                return;
+            }
+            if let Some(host) = app.selected_host() {
+                if let Some(ref source) = host.source_file {
+                    let alias = host.alias.clone();
+                    let path = source.display();
+                    app.notify_error(crate::messages::included_host_tag_there(&alias, &path));
+                    return;
+                }
+                let current_tags = host.tags.join(", ");
+                app.tags.cursor = current_tags.chars().count();
+                app.tags.input = Some(current_tags);
+            }
+        }
+        KeyCode::Char('s') => {
+            app.hosts_state.sort_mode = app.hosts_state.sort_mode.next();
+            app.apply_sort();
+            if let Err(e) = preferences::save_sort_mode(app.hosts_state.sort_mode) {
+                app.notify_error(crate::messages::sorted_by_save_failed(
+                    app.hosts_state.sort_mode.label(),
+                    &e,
+                ));
+            } else {
+                app.notify(crate::messages::sorted_by(
+                    app.hosts_state.sort_mode.label(),
+                ));
+            }
+        }
+        KeyCode::Char('g') => {
+            use crate::app::GroupBy;
+            match &app.hosts_state.group_by {
+                GroupBy::None => {
+                    app.hosts_state.group_by = GroupBy::Provider;
+                    app.hosts_state.group_filter = None;
+                    app.apply_sort();
+                    if let Err(e) = preferences::save_group_by(&app.hosts_state.group_by) {
+                        app.notify_error(crate::messages::grouped_by_save_failed(
+                            &app.hosts_state.group_by.label(),
+                            &e,
+                        ));
+                    } else {
+                        app.notify(crate::messages::grouped_by(
+                            &app.hosts_state.group_by.label(),
+                        ));
+                    }
+                }
+                GroupBy::Provider => {
+                    let user_tags: Vec<String> = {
+                        let mut seen = std::collections::HashSet::new();
+                        let mut tags = Vec::new();
+                        for host in &app.hosts_state.list {
+                            for tag in &host.tags {
+                                if seen.insert(tag.clone()) {
+                                    tags.push(tag.clone());
+                                }
+                            }
+                        }
+                        tags.sort_by_cached_key(|a| a.to_lowercase());
+                        tags
+                    };
+                    if user_tags.is_empty() {
+                        app.hosts_state.group_by = GroupBy::None;
+                        app.hosts_state.group_filter = None;
+                        app.apply_sort();
+                        if let Err(e) = preferences::save_group_by(&app.hosts_state.group_by) {
+                            app.notify_error(crate::messages::ungrouped_save_failed(&e));
+                        } else {
+                            app.notify(crate::messages::UNGROUPED);
+                        }
+                    } else {
+                        // Switch to tag mode directly. The nav bar shows all
+                        // tags as tabs, no picker needed.
+                        app.hosts_state.group_by = GroupBy::Tag(String::new());
+                        app.hosts_state.group_filter = None;
+                        app.apply_sort();
+                        if let Err(e) = preferences::save_group_by(&app.hosts_state.group_by) {
+                            app.notify_error(crate::messages::grouped_by_tag_save_failed(&e));
+                        } else {
+                            app.notify(crate::messages::GROUPED_BY_TAG);
+                        }
+                    }
+                }
+                GroupBy::Tag(_) => {
+                    app.hosts_state.group_by = GroupBy::None;
+                    app.hosts_state.group_filter = None;
+                    app.apply_sort();
+                    if let Err(e) = preferences::save_group_by(&app.hosts_state.group_by) {
+                        app.notify_error(crate::messages::ungrouped_save_failed(&e));
+                    } else {
+                        app.notify(crate::messages::UNGROUPED);
+                    }
+                }
+            }
+        }
+        KeyCode::Char('i') => {
+            if app.is_pattern_selected() {
+                return;
+            }
+            if let Some(index) = app.selected_host_index() {
+                app.set_screen(Screen::HostDetail { index });
+            }
+        }
+        KeyCode::Char('v') => {
+            app.hosts_state.view_mode = if app.hosts_state.view_mode == ViewMode::Compact {
+                ViewMode::Detailed
+            } else {
+                ViewMode::Compact
+            };
+            app.detail_toggle_pending = true;
+            app.ui.detail_scroll = 0;
+            if let Err(e) = preferences::save_view_mode(app.hosts_state.view_mode) {
+                log::warn!("[config] Failed to persist view mode: {e}");
+            }
+        }
+        KeyCode::Char(']') if app.hosts_state.view_mode == ViewMode::Detailed => {
+            app.ui.detail_scroll = app.ui.detail_scroll.saturating_add(1);
+        }
+        KeyCode::Char('[') if app.hosts_state.view_mode == ViewMode::Detailed => {
+            app.ui.detail_scroll = app.ui.detail_scroll.saturating_sub(1);
+        }
+        KeyCode::Char('u') => {
+            // Bulk-tag undo takes priority: the most recent bulk-tag apply
+            // can be reverted in one keystroke by restoring each host's
+            // previous tag list. After a successful undo the snapshot is
+            // cleared so the next `u` falls through to the deleted-host
+            // stack as usual.
+            if let Some(snapshot) = app.forms.bulk_tag_undo.take() {
+                let config_backup = app.hosts_state.ssh_config.clone();
+                for (alias, tags) in &snapshot {
+                    app.hosts_state.ssh_config.set_host_tags(alias, tags);
+                }
+                if let Err(e) = app.hosts_state.ssh_config.write() {
+                    app.hosts_state.ssh_config = config_backup;
+                    app.forms.bulk_tag_undo = Some(snapshot);
+                    app.notify_error(crate::messages::failed_to_save(&e));
+                } else {
+                    let count = snapshot.len();
+                    app.update_last_modified();
+                    app.reload_hosts();
+                    app.notify(crate::messages::restored_tags(count));
+                }
+            } else if let Some(deleted) = app.hosts_state.undo_stack.pop() {
+                let alias = match &deleted.element {
+                    ConfigElement::HostBlock(block) => block.host_pattern.clone(),
+                    _ => "host".to_string(),
+                };
+                app.hosts_state
+                    .ssh_config
+                    .insert_host_at(deleted.element, deleted.position);
+                if let Err(e) = app.hosts_state.ssh_config.write() {
+                    // Rollback: remove re-inserted host and restore undo buffer
+                    if let Some((element, position)) =
+                        app.hosts_state.ssh_config.delete_host_undoable(&alias)
+                    {
+                        app.hosts_state
+                            .undo_stack
+                            .push(crate::app::DeletedHost { element, position });
+                    }
+                    app.notify_error(crate::messages::failed_to_save(&e));
+                } else {
+                    app.update_last_modified();
+                    app.reload_hosts();
+                    app.notify(crate::messages::host_restored(&alias));
+                }
+            } else {
+                app.notify_warning(crate::messages::NOTHING_TO_UNDO);
+            }
+        }
+        KeyCode::Char('#') => {
+            app.open_tag_picker();
+        }
+        KeyCode::Char('m') => {
+            let current = crate::ui::theme::current_theme().name;
+            let builtins = crate::ui::theme::ThemeDef::builtins();
+            let custom = crate::ui::theme::ThemeDef::load_custom();
+            let idx = builtins
+                .iter()
+                .position(|t| t.name.eq_ignore_ascii_case(&current))
+                .or_else(|| {
+                    if custom.is_empty() {
+                        None
+                    } else {
+                        custom
+                            .iter()
+                            .position(|t| t.name.eq_ignore_ascii_case(&current))
+                            .map(|i| builtins.len() + 1 + i) // +1 for divider
+                    }
+                })
+                .unwrap_or(0);
+            app.ui.theme_picker.list.select(Some(idx));
+            app.ui.theme_picker.builtins = builtins;
+            app.ui.theme_picker.custom = custom;
+            app.ui.theme_picker.saved_name =
+                crate::preferences::load_theme().unwrap_or_else(|| "Purple".to_string());
+            app.ui.theme_picker.original = Some(crate::ui::theme::current_theme());
+            app.set_screen(Screen::ThemePicker);
+        }
+        KeyCode::Char('T') => {
+            if app.is_pattern_selected() {
+                return;
+            }
+            if let Some(host) = app.selected_host() {
+                let stale_hint = if host.stale.is_some() {
+                    Some(super::stale_provider_hint(host))
+                } else {
+                    None
+                };
+                let alias = host.alias.clone();
+                if let Some(hint) = stale_hint {
+                    app.notify_warning(crate::messages::stale_host(&hint));
+                }
+                app.refresh_tunnel_list(&alias);
+                app.ui.tunnel_list_state = ratatui::widgets::ListState::default();
+                if !app.tunnels.list.is_empty() {
+                    app.ui.tunnel_list_state.select(Some(0));
+                }
+                app.set_screen(Screen::TunnelList { alias });
+            }
+        }
+        KeyCode::Char('S') => {
+            if !app.demo_mode {
+                app.providers.config = crate::providers::config::ProviderConfig::load();
+            }
+            app.ui.provider_list_state = ratatui::widgets::ListState::default();
+            app.ui.provider_list_state.select(Some(0));
+            app.set_screen(Screen::Providers);
+        }
+        KeyCode::Char('I') => {
+            let count = crate::import::count_known_hosts_candidates();
+            if count > 0 {
+                app.set_screen(Screen::ConfirmImport { count });
+            } else {
+                app.notify_warning(crate::messages::NO_IMPORTABLE_HOSTS);
+            }
+        }
+        KeyCode::Char('X') => {
+            let stale = app.hosts_state.ssh_config.stale_hosts();
+            if stale.is_empty() {
+                app.notify_warning(crate::messages::NO_STALE_HOSTS);
+            } else {
+                let aliases: Vec<String> = stale.into_iter().map(|(a, _)| a).collect();
+                app.set_screen(Screen::ConfirmPurgeStale {
+                    aliases,
+                    provider: None,
+                });
+            }
+        }
+        KeyCode::Char('V') => actions::initiate_bulk_vault_sign(app),
+        KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if app.is_pattern_selected() {
+                return;
+            }
+            if let Some(idx) = app.selected_host_index() {
+                if app.hosts_state.multi_select.contains(&idx) {
+                    app.hosts_state.multi_select.remove(&idx);
+                } else {
+                    app.hosts_state.multi_select.insert(idx);
+                }
+            }
+        }
+        KeyCode::Char(' ') => {
+            // Plain Space mirrors Ctrl+Space so users familiar with
+            // ranger/k9s/mutt's muscle memory get the same mark toggle
+            // without a modifier. Ctrl+Space still works.
+            if app.is_pattern_selected() {
+                return;
+            }
+            if let Some(idx) = app.selected_host_index() {
+                if app.hosts_state.multi_select.contains(&idx) {
+                    app.hosts_state.multi_select.remove(&idx);
+                } else {
+                    app.hosts_state.multi_select.insert(idx);
+                }
+            }
+        }
+        KeyCode::Char('r') => {
+            if app.is_pattern_selected() {
+                return;
+            }
+            let (aliases, stale_hint): (Vec<String>, Option<String>) =
+                if app.hosts_state.multi_select.is_empty() {
+                    if let Some(host) = app.selected_host() {
+                        let hint = if host.stale.is_some() {
+                            Some(super::stale_provider_hint(host))
+                        } else {
+                            None
+                        };
+                        (vec![host.alias.clone()], hint)
+                    } else {
+                        (Vec::new(), None)
+                    }
+                } else {
+                    let has_stale = app.hosts_state.multi_select.iter().any(|&idx| {
+                        app.hosts_state
+                            .list
+                            .get(idx)
+                            .is_some_and(|h| h.stale.is_some())
+                    });
+                    (
+                        app.hosts_state
+                            .multi_select
+                            .iter()
+                            .filter_map(|&idx| {
+                                app.hosts_state.list.get(idx).map(|h| h.alias.clone())
+                            })
+                            .collect(),
+                        if has_stale {
+                            Some(" Selection includes stale hosts.".to_string())
+                        } else {
+                            None
+                        },
+                    )
+                };
+            if let Some(hint) = stale_hint {
+                app.notify_warning(crate::messages::stale_host(&hint));
+            }
+            if aliases.is_empty() {
+                app.notify_warning(crate::messages::NO_HOST_SELECTED);
+            } else {
+                super::snippet::open_snippet_picker(app, aliases);
+            }
+        }
+        KeyCode::Char('R') => {
+            if app.is_pattern_selected() {
+                return;
+            }
+            let aliases: Vec<String> = app
+                .hosts_state
+                .display_list
+                .iter()
+                .filter_map(|item| match item {
+                    crate::app::HostListItem::Host { index } => {
+                        Some(app.hosts_state.list[*index].alias.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            if aliases.is_empty() {
+                app.notify_warning(crate::messages::NO_HOSTS_TO_RUN);
+            } else {
+                super::snippet::open_snippet_picker(app, aliases);
+            }
+        }
+        KeyCode::Char(':') => {
+            log::debug!("palette: opened from host list");
+            app.palette = Some(crate::app::CommandPaletteState::default());
+        }
+        KeyCode::Char('F') => actions::open_file_browser(app, events_tx),
+        KeyCode::Char('C') => actions::open_container_overlay(app, events_tx),
+        KeyCode::Char('n') if app.search.query.is_none() => {
+            log::debug!("[purple] opening whats-new overlay via n");
+            super::whats_new::dismiss_whats_new_toast(app);
+            app.set_screen(Screen::WhatsNew(crate::app::WhatsNewState::default()));
+        }
+        KeyCode::Char('?') => {
+            let old = std::mem::replace(&mut app.screen, Screen::HostList);
+            app.set_screen(Screen::Help {
+                return_screen: Box::new(old),
+            });
+        }
+        _ => {}
+    }
+}
+
+pub(super) fn handle_host_list_search(
+    app: &mut App,
+    key: KeyEvent,
+    events_tx: &mpsc::Sender<AppEvent>,
+) {
+    match key.code {
+        KeyCode::Esc => {
+            app.cancel_search();
+        }
+        KeyCode::Enter => {
+            if let Some(host) = app.selected_host() {
+                let alias = host.alias.clone();
+                let askpass = host.askpass.clone();
+                let stale_hint = if host.stale.is_some() {
+                    Some(super::stale_provider_hint(host))
+                } else {
+                    None
+                };
+                app.cancel_search();
+                if let Some(hint) = stale_hint {
+                    app.notify_warning(crate::messages::stale_host(&hint));
+                }
+                if app.demo_mode {
+                    app.notify(crate::messages::DEMO_CONNECTION_DISABLED);
+                    return;
+                }
+                app.pending_connect = Some((alias, askpass));
+            }
+        }
+        KeyCode::Down | KeyCode::Tab => {
+            app.select_next();
+        }
+        KeyCode::Up | KeyCode::BackTab => {
+            app.select_prev();
+        }
+        KeyCode::PageDown => {
+            app.page_down_host();
+        }
+        KeyCode::PageUp => {
+            app.page_up_host();
+        }
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if !app.ping.status.is_empty() {
+                app.ping.status.clear();
+                app.ping.checked_at = None;
+                app.ping.generation += 1;
+                if app.ping.filter_down_only {
+                    app.cancel_search();
+                } else {
+                    app.ping.filter_down_only = false;
+                }
+                app.status_center.status = None;
+            } else {
+                super::ping::ping_selected_host(app, events_tx, false);
+            }
+        }
+        KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(idx) = app.selected_host_index() {
+                if app.hosts_state.multi_select.contains(&idx) {
+                    app.hosts_state.multi_select.remove(&idx);
+                } else {
+                    app.hosts_state.multi_select.insert(idx);
+                }
+            }
+        }
+        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let visible_indices: Vec<usize> = app.search.filtered_indices.clone();
+            let all_selected = !visible_indices.is_empty()
+                && visible_indices
+                    .iter()
+                    .all(|idx| app.hosts_state.multi_select.contains(idx));
+            if all_selected {
+                app.hosts_state.multi_select.clear();
+            } else {
+                for idx in visible_indices {
+                    app.hosts_state.multi_select.insert(idx);
+                }
+            }
+        }
+        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(host) = app.selected_host().cloned() {
+                super::open_edit_form(app, host);
+            }
+        }
+        KeyCode::Char('!') if app.ping.filter_down_only => {
+            app.ping.filter_down_only = false;
+            if app.search.query.as_ref().is_some_and(|q| q.is_empty()) {
+                app.cancel_search();
+            } else {
+                app.apply_filter();
+            }
+            app.status_center.status = None;
+        }
+        KeyCode::Char(c) => {
+            if let Some(ref mut query) = app.search.query {
+                query.push(c);
+            }
+            app.apply_filter();
+        }
+        KeyCode::Backspace => {
+            if let Some(ref mut query) = app.search.query {
+                query.pop();
+            }
+            app.apply_filter();
+        }
+        _ => {}
+    }
+}
